@@ -276,6 +276,12 @@ class _Task(QRunnable):
         super().__init__()
         self.fn = fn
         self.signals = _Signals()
+        # 关掉线程池的自动删除：QRunnable 默认在 run() 返回后立刻被线程池
+        # delete，而 finished 的跨线程投递（排队事件）此刻可能还没走完 ——
+        # 接收方在 MetaCall 收尾阶段要摸发送方的连接表，摸到已释放内存就是
+        # 0xc0000005（2026-09-22 闪退的直接成因之一）。
+        # 生命周期改由 Python 侧管理：调用方持有引用，下一轮任务时替换。
+        self.setAutoDelete(False)
 
     def run(self):
         try:
@@ -286,17 +292,34 @@ class _Task(QRunnable):
 
 
 def _task(fn, on_done) -> _Task:
-    """起一个后台任务，完成后把结果交给 on_done（主线程执行）。"""
+    """起一个后台任务，完成后把结果交给 on_done（主线程执行）。
+
+    2026-09-22 闪退修复定下的两条硬规矩，调用方必须都遵守：
+    1. on_done 必须是 **QObject 子类实例的绑定方法**。跨线程 emit 时
+       PySide6 按「接收者是谁」决定投递：QObject 方法 → 排队进接收者
+       所在线程（主线程）；普通对象 / lambda → 事件落进线程池临时线程的
+       队列，池线程 30 秒过期回收 —— 回调静默丢失，还伴随对已释放 C++
+       对象的访问（实测 6.11.2，见 outputs/_thread_affinity_result.txt）。
+    2. 返回的 task 必须由调用方持有（通常存到 self 上，下一轮替换），
+       确保它的析构只发生在主线程的确定时点，而不是线程池里的任意时刻。
+    """
     task = _Task(fn)
     task.signals.finished.connect(on_done)
     QThreadPool.globalInstance().start(task)
     return task
 
 
-class App:
-    """组装两套子系统，集中处理采集后的落库、刷新与告警。"""
+class App(QObject):
+    """组装两套子系统，集中处理采集后的落库、刷新与告警。
+
+    必须继承 QObject：_task() 把跨线程信号连到 self.on_devices 这类方法上，
+    只有 QObject 子类实例的绑定方法才带「排队投递回主线程」的语义 ——
+    普通类的绑定方法等于把事件推进线程池临时线程（静默丢失 +
+    use-after-free），正是设备监控每 5 分钟埋一颗雷、跑几个小时后闪退的根源。
+    """
 
     def __init__(self, qapp: QApplication):
+        super().__init__()
         self.qapp = qapp
         # 关窗不退出：主面板收进托盘、悬浮窗留着，退出只走托盘菜单或「退出」按钮
         self.qapp.setQuitOnLastWindowClosed(False)
@@ -307,6 +330,8 @@ class App:
         self.cfg = Config()
         self._local_ip = ""
         self._device_dlg: DevicesDialog | None = None
+        # 设备查询的在飞任务：调用方必须持有（_task 规矩 #2）
+        self._dev_task: _Task | None = None
 
         # ---------------- 延迟侧 ----------------
         self.hub = StatsHub()
@@ -592,7 +617,11 @@ class App:
         def work():
             return self.watcher.refresh(account=account, local_ip=ip)
 
-        _task(work, self.on_devices)
+        # 持有在飞任务（_task 规矩 #2），下一轮查询时被新任务替换。
+        # 旧写法直接丢弃返回值：App 不是 QObject（回调静默丢失）+
+        # 任务跑完即被线程池回收（use-after-free），两处缺陷叠加，
+        # 设备监控的完成回调一次都没执行过，且每轮都是一颗崩溃雷。
+        self._dev_task = _task(work, self.on_devices)
 
     def on_devices(self, result) -> None:
         if isinstance(result, Exception):

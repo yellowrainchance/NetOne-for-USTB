@@ -30,6 +30,10 @@ class _Worker(QRunnable):
         super().__init__()
         self.fn = fn
         self.signals = _Signals()
+        # 禁用线程池自动删除：run() 返回后 finished 的跨线程投递可能还没
+        # 走完，此刻被线程池 delete = 接收方收尾阶段摸已释放内存（闪退成因）。
+        # 生命周期归调用方：refresh_now 持有到下一轮刷新时替换。
+        self.setAutoDelete(False)
 
     def run(self):  # 在线程池中执行
         try:
@@ -50,6 +54,7 @@ class CampusMonitor(QObject):
         self.cfg = cfg
         self._busy = False
         self._pending = False   # 忙时收到刷新请求 → 排队，完成后补刷
+        self._worker: _Worker | None = None   # 在飞任务，调用方持有（闪退修复）
         self._pool = QThreadPool.globalInstance()
         self._timer = QTimer(self)
         self._timer.timeout.connect(self.refresh_now)
@@ -86,6 +91,10 @@ class CampusMonitor(QObject):
         self._busy = True
         worker = _Worker(lambda: collect(self.cfg))
         worker.signals.finished.connect(self._on_done)
+        # 持有在飞任务，下一轮刷新时替换：autoDelete(False) 之后生命周期
+        # 归调用方，引用的建立与释放都发生在主线程的确定时点（2026-09-22
+        # 闪退修复，与 app.py/_task、ui/devices_dialog.py 同一批规矩）。
+        self._worker = worker
         self._pool.start(worker)
 
     # ---------- 回调 ----------

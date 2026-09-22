@@ -39,6 +39,10 @@ class _Task(QRunnable):
         super().__init__()
         self.fn = fn
         self.signals = _Signals()
+        # 与 app.py 的 _Task 同规矩：禁用线程池自动删除，生命周期归调用方。
+        # 跑完即被线程池 delete + 跨线程投递尚未走完 = 收尾阶段摸已释放对象
+        # （0xc0000005 闪退的成因之一，2026-09-22 修复）。
+        self.setAutoDelete(False)
 
     def run(self) -> None:
         try:
@@ -64,6 +68,8 @@ class DevicesDialog(QDialog):
         self._seq = 0
         self._busy = False
         self._pending = False
+        self._task: _Task | None = None        # 在飞的查询任务（调用方持有）
+        self._kick_task: _Task | None = None   # 在飞的强制下线任务
 
         self.setWindowTitle("设备管理 · 校园网在线终端")
         self.resize(760, 460)
@@ -148,13 +154,25 @@ class DevicesDialog(QDialog):
         api = EPortalAPI(campus.eportal_host, campus.eportal_port, campus.timeout)
 
         task = _Task(lambda: api.find_devices(account, self.local_ip))
-        task.signals.finished.connect(lambda result, s=seq: self._on_done(result, s))
-        # 必须持有 runnable 的 Python 引用：QThreadPool.start 不转移所有权，
-        # 没有这个引用时 task（连带 signals）会在 fn 执行后被 GC，
-        # finished 信号 emit 到一个已销毁的 QObject 上 —— **静默丢失**。
-        # 实测症状：fn 真的跑了，但状态栏永远停在「正在查询…」。
+        task.seq = seq                         # 序号挂在任务上，见 _on_task_done
+        # 接收者必须是 QObject 方法（self 是 QDialog）：跨线程 emit 会排队
+        # 投递回主线程。旧写法用 lambda 包 seq，PySide6 拿不到 QObject 接收者，
+        # 事件落进线程池临时线程的队列 —— 回调静默丢失 + 踩已释放对象。
+        task.signals.finished.connect(self._on_task_done)
+        # 持有 runnable 的 Python 引用：setAutoDelete(False) 之后线程池不再
+        # 管它的生命周期，由这里持有、下一次查询时替换（app.py _task 规矩 #2）。
         self._task = task
         QThreadPool.globalInstance().start(task)
+
+    def _on_task_done(self, result) -> None:
+        """查询结果统一落点：从任务对象上取回请求序号，再走原有分发逻辑。
+
+        序号挂在 task 上而不是闭包里，是因为连接必须是「QObject 方法」
+        才能保证跨线程投递正确 —— lambda 捕获 seq 的写法进不了这条路径。
+        """
+        task = self._task
+        self._task = None
+        self._on_done(result, task.seq if task is not None else -1)
 
     def _on_done(self, result, seq: int) -> None:
         if seq != self._seq:
@@ -256,6 +274,9 @@ class DevicesDialog(QDialog):
 
         task = _Task(work)
         task.signals.finished.connect(self._on_kick)
+        # _on_kick 是 QObject 方法（投递路径正确），但引用仍必须由 self 持有
+        # 到回调执行（规矩 #2）：不持有则析构时机不可控，仍是同族风险。
+        self._kick_task = task
         QThreadPool.globalInstance().start(task)
 
     def _on_kick(self, result) -> None:
